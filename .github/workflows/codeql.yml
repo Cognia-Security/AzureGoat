@@ -6,12 +6,13 @@ on:
   pull_request:
     branches: [ "master" ]
   schedule:
-    - cron: '38 13 * * 3'
+    - cron: '40 20 * * 3'
   workflow_dispatch:
+
 jobs:
   analyze:
-    name: Analyze (${{ matrix.language }})
-    runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
+    name: "Analyze (${{ matrix.language }})"
+    runs-on: ubuntu-latest
     permissions:
       security-events: write
       packages: read
@@ -22,146 +23,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - language: c-cpp
-            build-mode: manual
-          - language: javascript-typescript
-            build-mode: none
-          - language: python
-            build-mode: none
+        - language: javascript-typescript
+          build-mode: none
+        - language: python
+          build-mode: none
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: recursive
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: ${{ matrix.language }}
-          build-mode: ${{ matrix.build-mode }}
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: ${{ matrix.language }}
+        queries: security-extended
 
-      - name: Install toolchain & helpers (C/C++)
-        if: matrix.language == 'c-cpp'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential clang cmake ninja-build pkg-config \
-            libssl-dev zlib1g-dev libffi-dev \
-            meson autoconf automake libtool \
-            scons qtbase5-dev qtbase5-dev-tools \
-            bear
-          python3 -m pip install --upgrade pip
-          python3 -m pip install compiledb
+    - name: Perform CodeQL Analysis
+      id: analyze
+      uses: github/codeql-action/analyze@v3
+      with:
+        category: "/language:${{matrix.language}}"
+        output: ${{ runner.temp }}/codeql-${{ matrix.language }}
 
-      # -------- Meson --------
-      - name: Build with Meson (generates compile_commands.json)
-        if: matrix.language == 'c-cpp' && hashFiles('meson.build') != ''
-        run: |
-          meson setup build --buildtype=debugoptimized
-          meson compile -C build -j"$(nproc)"
-        env:
-          CODEQL_EXTRACTOR_CPP_COMPILE_COMMANDS: ${{ github.workspace }}/build/compile_commands.json
-
-      # -------- Autotools (configure / autogen.sh) --------
-      - name: Build with Autotools (captured via bear)
-        if: matrix.language == 'c-cpp' && (hashFiles('configure') != '' || hashFiles('configure.ac') != '' || hashFiles('autogen.sh') != '')
-        run: |
-          if [ -f autogen.sh ]; then ./autogen.sh; fi
-          if [ -x configure ]; then
-            CC=clang CXX=clang++ ./configure
-          elif [ -f configure.ac ]; then
-            autoreconf -fi
-            CC=clang CXX=clang++ ./configure
-          fi
-          bear -- make -j"$(nproc)" || make -j"$(nproc)"
-        env:
-          CODEQL_EXTRACTOR_CPP_COMPILE_COMMANDS: ${{ github.workspace }}/compile_commands.json
-
-      # -------- SCons --------
-      - name: Build with SCons (captured via bear)
-        if: matrix.language == 'c-cpp' && hashFiles('SConstruct') != ''
-        run: |
-          bear -- scons -j"$(nproc)" || scons -j"$(nproc)"
-        env:
-          CODEQL_EXTRACTOR_CPP_COMPILE_COMMANDS: ${{ github.workspace }}/compile_commands.json
-
-      # -------- qmake (.pro) --------
-      - name: Build with qmake (captured via bear)
-        if: matrix.language == 'c-cpp' && hashFiles('**/*.pro') != ''
-        run: |
-          qmake || qmake-qt5 || true
-          bear -- make -j"$(nproc)" || make -j"$(nproc)"
-        env:
-          CODEQL_EXTRACTOR_CPP_COMPILE_COMMANDS: ${{ github.workspace }}/compile_commands.json
-
-      # -------- Ninja-only (build.ninja present) --------
-      - name: Build with Ninja (captured via bear)
-        if: matrix.language == 'c-cpp' && hashFiles('build.ninja') != ''
-        run: |
-          bear -- ninja -j"$(nproc)" || ninja -j"$(nproc)"
-        env:
-          CODEQL_EXTRACTOR_CPP_COMPILE_COMMANDS: ${{ github.workspace }}/compile_commands.json
-
-      # -------- Bazel (see NOTE) --------
-      - name: Detect Bazel workspace (informational)
-        if: matrix.language == 'c-cpp' && (hashFiles('WORKSPACE*') != '' || hashFiles('MODULE.bazel') != '')
-        run: |
-          echo "Bazel detected. For accurate CodeQL C/C++ extraction, generate compile_commands.json via a Bazel aspect (e.g., @hedron_compile_commands)."
-          echo "If you already generate it, ensure it ends up at $GITHUB_WORKSPACE/compile_commands.json or set CODEQL_EXTRACTOR_CPP_COMPILE_COMMANDS accordingly."
-
-      # -------- Custom script --------
-      - name: Build with custom script (captured via bear)
-        if: matrix.language == 'c-cpp' && hashFiles('scripts/build.sh') != ''
-        run: |
-          chmod +x scripts/build.sh
-          bear -- bash scripts/build.sh || bash scripts/build.sh
-        env:
-          CODEQL_EXTRACTOR_CPP_COMPILE_COMMANDS: ${{ github.workspace }}/compile_commands.json
-
-      # -------- Fallback: try compiledb if object files exist but no compile_commands --------
-      - name: Generate compile_commands.json with compiledb (best-effort)
-        if: matrix.language == 'c-cpp' && hashFiles('compile_commands.json') == '' && hashFiles('build/compile_commands.json') == ''
-        run: |
-          # Try to synthesize from build logs (works best with Make/Ninja)
-          compiledb -n make || true
-          compiledb -n ninja || true
-          # Symlink to build dir version if Meson created it
-          if [ -f build/compile_commands.json ] && [ ! -f compile_commands.json ]; then
-            ln -s build/compile_commands.json compile_commands.json
-          fi
-        env:
-          CODEQL_EXTRACTOR_CPP_COMPILE_COMMANDS: ${{ github.workspace }}/compile_commands.json
-
-      # -------- Validate we have something to analyze --------
-      - name: Verify compile_commands.json exists
-        if: matrix.language == 'c-cpp'
-        run: |
-          set -e
-          if [ -f build/compile_commands.json ]; then
-            echo "Found build/compile_commands.json"
-          elif [ -f compile_commands.json ]; then
-            echo "Found compile_commands.json"
-          else
-            echo "::error ::No compile_commands.json produced. Either your project doesn't actually compile C/C++, or we need explicit build commands."
-            echo "::notice ::If the repo only has headers or no C/C++ targets, remove 'c-cpp' from the CodeQL matrix."
-            exit 1
-          fi
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-        with:
-          category: "/language:${{ matrix.language }}"
-          output: codeql-report-${{ matrix.language }}.sarif
-
-      - name: Upload logs & SARIF
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: codeql-logs-${{ matrix.language }}
-          path: |
-            codeql-report-${{ matrix.language }}.sarif
-            **/compile_commands.json
-            **/CMakeFiles/CMakeOutput.log
-            **/CMakeFiles/CMakeError.log
+    - name: Upload SARIF Report as Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: codeql-report-${{ matrix.language }}
+        path: ${{ steps.analyze.outputs.sarif-output }}
